@@ -2,24 +2,13 @@
 -- Copyright (C) Jinzheng Zhang (tianchaijz)
 
 
-local core = require "resty.master.stream.core"
-
-local type = type
+local pairs = pairs
 local ipairs = ipairs
 local assert = assert
-local setmetatable = setmetatable
+local table_sort = table.sort
 
 
 local _M = {}
-local _mt = { __index = _M }
-local _handlers = {}
-local _inits = {}  -- init worker hooks
-local _inits_loaded = {}
-
-
-_M.PREREAD_PHASE       = core.PREREAD_PHASE
-_M.CONTENT_PHASE       = core.CONTENT_PHASE
-_M.LOG_PHASE           = core.LOG_PHASE
 
 
 local function is_tbl(obj) return type(obj) == "table" end
@@ -40,7 +29,9 @@ local function load_module_phase(module, phase)
 
         module = module[1]
     end
+
     local mod = assert(require(module), module)
+
     return module, mod[phase], phase_ctx or {}
 end
 
@@ -55,72 +46,67 @@ local function phase_handler(modules, phase)
             index[module] = chain
         end
     end
+
     return { chain = chain, index = index }
 end
 
 
-local function next_handler(self, phase, module)
-    local ph = _handlers[self._type][phase]
-    if not ph then
-        return
-    end
-
-    local chain = ph.index[module].next
-    if chain then
-        return chain.handler(self, chain.ctx)
-    end
-end
-
-
-local function run_phase(self)
-    local ph = _handlers[self._type][self._phase]
-    local chain = ph.chain
-    if chain then
-        chain.handler(self, chain.ctx)
-    end
-end
-
-
-function _M.new(typ)
-    local r = { _ctx = {}, _type = typ, _phase = 0 }
-    return setmetatable(r, _mt)
-end
-
-
-function _M.register(typ, modules)
+local function register(typ, modules, phase_init, phase_begin, phase_end,
+                        handlers, inits, inits_loaded)
     local handler = {}
-    for phase = _M.PREREAD_PHASE, _M.LOG_PHASE, 1 do
+    for phase = phase_begin, phase_end, 1 do
         handler[phase] = phase_handler(modules, phase)
     end
-    _handlers[typ] = handler
+
+    handlers[typ] = handler
 
     for _, mod in ipairs(modules) do
-        local module, init, ctx = load_module_phase(mod, core.INIT_WORKER)
+        local module, init, ctx = load_module_phase(mod, phase_init)
         if init and init.handler then
             if not ctx then
-                if _inits_loaded[module] then
+                if inits_loaded[module] then
                     ngx.log(ngx.ERR, module,
                             " init multiple times without context")
                 else
-                    _inits_loaded[module] = true
+                    inits_loaded[module] = true
                 end
             end
 
-            _inits[#_inits + 1] = { init.handler, ctx }
+            inits[#inits + 1] = { init.handler, ctx }
         end
+    end
+
+    ngx.log(ngx.INFO, "addon registered: ", typ)
+end
+_M.register = register
+
+
+function _M.register_handlers(registry, phase_init, phase_begin, phase_end,
+                              handlers, inits, inits_loaded)
+    local array = {}
+    for typ, handler in pairs(registry) do
+        if handler.enable ~= false then
+            local p = handler.priority or 999
+            array[#array + 1] = { p, typ, handler.modules }
+        end
+    end
+
+    -- lower priorities indicate programs that start first
+    table_sort(array, function(a, b) return a[1] < b[1] end)
+
+    for _, handler in ipairs(array) do
+        register(handler[2], handler[3], phase_init, phase_begin, phase_end,
+                 handlers, inits, inits_loaded)
     end
 end
 
 
-function _M.init()
+function _M.init(inits)
     local handler, ctx
-    for _, init in ipairs(_inits) do
+    for _, init in ipairs(inits) do
         handler, ctx = init[1], init[2]
         handler(ctx)
     end
-
-    _inits = {}
-    _inits_loaded = {}
 end
 
 
@@ -156,24 +142,41 @@ function _M.set_module_ctx(self, module, ctx)
 end
 
 
-function _M.next_handler(self, module)
-    return next_handler(self, self._phase, module)
+local function run_phase(self, handlers)
+    local ph = handlers[self._type][self._phase]
+    local chain = ph.chain
+    if chain then
+        chain.handler(self, chain.ctx)
+    end
 end
 
 
-function _M.run(self, phase)
+function _M.run(self, phase, handlers)
     local old_phase = self._phase
     set_phase(self, phase)
-    run_phase(self)
+    run_phase(self, handlers)
     set_phase(self, old_phase)
 end
 
 
-function _M.exec(self, typ)
+function _M.exec(self, typ, handlers)
     local old_phase = self._phase
     set_type(self, typ)
-    run_phase(self)
+    run_phase(self, handlers)
     set_phase(self, old_phase)
+end
+
+
+function _M.next_handler(self, module, handlers)
+    local ph = handlers[self._type][self._phase]
+    if not ph then
+        return
+    end
+
+    local chain = ph.index[module].next
+    if chain then
+        return chain.handler(self, chain.ctx)
+    end
 end
 
 
